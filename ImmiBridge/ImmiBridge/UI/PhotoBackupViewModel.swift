@@ -1067,9 +1067,23 @@ final class PhotoBackupViewModel: ObservableObject {
         }
     }
 
-    /// Ask macOS to show the Local Network privacy dialog (Bonjour browse).
+    /// Ask macOS to show the Local Network privacy dialog (Bonjour + TCP probe).
     func requestLocalNetworkPermission() {
-        LocalNetworkPermission.requestPrompt()
+        if let hp = LocalNetworkPermission.hostPort(from: immichServerURL) {
+            LocalNetworkPermission.requestPrompt(host: hp.host, port: hp.port)
+        } else {
+            LocalNetworkPermission.requestPrompt()
+        }
+    }
+
+    /// Request Local Network access, then re-test Immich. Bound to the alert button.
+    func requestLocalNetworkPermissionAndRetry() {
+        requestLocalNetworkPermission()
+        // Small delay so NWBrowser/NWConnection start before the HTTP retry path.
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            testImmich()
+        }
     }
 
     func testImmich() {
@@ -1094,31 +1108,64 @@ final class PhotoBackupViewModel: ObservableObject {
             return
         }
 
-        // URLSession alone often fails with "Local network prohibited" without ever
-        // showing the TCC sheet. Kick Bonjour first when targeting a LAN host.
         let isLocal = isLocalNetworkURL(immichServerURL)
-        if isLocal {
-            LocalNetworkPermission.requestPrompt()
-        }
-
+        let hostPort = LocalNetworkPermission.hostPort(from: immichServerURL)
         let apiKey = immichApiKey
         let apiBase = (base.lastPathComponent == "api") ? base : base.appendingPathComponent("api")
-        var pingReq = URLRequest(url: apiBase.appendingPathComponent("server/ping"))
-        pingReq.setValue(apiKey, forHTTPHeaderField: "x-api-key")
-        // Local LAN HTTP (http://192.168.x.x) is common for Immich; allow enough time
-        // for the user to answer the Local Network permission sheet on first try.
-        pingReq.timeoutInterval = isLocal ? 20 : 15
+        let serverURLSnapshot = immichServerURL
+        let appIdentity = Self.localNetworkAppIdentityDescription()
+
+        // Dedicated session: waitsForConnectivity lets the request pause while the
+        // user answers the Local Network sheet instead of failing immediately.
+        let config = URLSessionConfiguration.ephemeral
+        config.waitsForConnectivity = true
+        config.timeoutIntervalForRequest = isLocal ? 30 : 15
+        config.timeoutIntervalForResource = isLocal ? 60 : 30
+        let session = URLSession(configuration: config)
 
         Task.detached { [weak self] in
-            // Give TCC a moment to present the Local Network sheet before HTTP starts.
-            if isLocal {
-                try? await Task.sleep(nanoseconds: 800_000_000)
+            // Pre-flight: trigger + await Local Network decision for LAN hosts.
+            // While the system sheet is open, macOS reports "denied" immediately —
+            // ensureAccess waits for Allow (or times out) instead of failing the UI.
+            if isLocal, let hp = hostPort {
+                await MainActor.run { [weak self] in
+                    self?.immichTestStatus = "Waiting for Local Network…"
+                    self?.showImmichConnectionError = false
+                }
+                let access = await LocalNetworkPermission.ensureAccess(
+                    host: hp.host,
+                    port: hp.port,
+                    timeout: 45
+                )
+                if access == .denied {
+                    await MainActor.run { [weak self] in
+                        guard let self = self else { return }
+                        self.immichTestStatus = "Local Network blocked"
+                        self.immichIsConnected = false
+                        self.showLocalNetworkPermissionNeeded = true
+                        self.immichConnectionErrorMessage = Self.localNetworkBlockedMessage(
+                            appIdentity: appIdentity,
+                            detail: "Local Network access was not granted for \(hp.host):\(hp.port)."
+                        )
+                        self.showImmichConnectionError = true
+                    }
+                    return
+                }
+                await MainActor.run { [weak self] in
+                    self?.immichTestStatus = "Testing…"
+                }
             }
 
+            var pingReq = URLRequest(url: apiBase.appendingPathComponent("server/ping"))
+            pingReq.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+            pingReq.timeoutInterval = isLocal ? 30 : 15
+
             var lastError: Error?
-            for attempt in 1...3 {
+            // More retries on LAN: first attempts often race the permission sheet.
+            let maxAttempts = isLocal ? 5 : 3
+            for attempt in 1...maxAttempts {
                 do {
-                    let (pingData, pingResp) = try await URLSession.shared.data(for: pingReq)
+                    let (pingData, pingResp) = try await session.data(for: pingReq)
                     guard let http = pingResp as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
                         throw NSError(domain: "immich", code: (pingResp as? HTTPURLResponse)?.statusCode ?? -1)
                     }
@@ -1126,7 +1173,7 @@ final class PhotoBackupViewModel: ObservableObject {
 
                     var meReq = URLRequest(url: apiBase.appendingPathComponent("users/me"))
                     meReq.setValue(apiKey, forHTTPHeaderField: "x-api-key")
-                    let (_, meResp) = try await URLSession.shared.data(for: meReq)
+                    let (_, meResp) = try await session.data(for: meReq)
                     guard let http2 = meResp as? HTTPURLResponse, (200...299).contains(http2.statusCode) else {
                         throw NSError(domain: "immich", code: (meResp as? HTTPURLResponse)?.statusCode ?? -2)
                     }
@@ -1136,7 +1183,7 @@ final class PhotoBackupViewModel: ObservableObject {
                     var statsReq = URLRequest(url: apiBase.appendingPathComponent("assets/statistics"))
                     statsReq.setValue(apiKey, forHTTPHeaderField: "x-api-key")
                     let start = Date()
-                    let (_, statsResp) = try await URLSession.shared.data(for: statsReq)
+                    let (_, statsResp) = try await session.data(for: statsReq)
                     guard let http3 = statsResp as? HTTPURLResponse, (200...299).contains(http3.statusCode) else {
                         throw NSError(domain: "immich", code: (statsResp as? HTTPURLResponse)?.statusCode ?? -3)
                     }
@@ -1147,28 +1194,34 @@ final class PhotoBackupViewModel: ObservableObject {
                         self?.immichIsConnected = true
                         self?.showImmichConnectionError = false
                         self?.immichConnectionErrorMessage = ""
+                        self?.showLocalNetworkPermissionNeeded = false
                     }
                     return
                 } catch {
-                    lastError = error
-                    if attempt < 3 {
+                    let caught = error
+                    lastError = caught
+                    if attempt < maxAttempts {
+                        let isLN = await MainActor.run { [weak self] in
+                            guard let self = self else { return isLocal }
+                            return self.isLocalNetworkPermissionError(caught)
+                        }
                         await MainActor.run { [weak self] in
-                            self?.immichTestStatus = "Testing… (\(attempt + 1)/3)"
-                            // Re-arm Bonjour browse between retries so a dismissed sheet can reappear.
-                            if isLocal {
+                            if isLN {
+                                self?.immichTestStatus = "Waiting for Local Network…"
                                 self?.requestLocalNetworkPermission()
+                            } else {
+                                self?.immichTestStatus = "Testing… (\(attempt + 1)/\(maxAttempts))"
                             }
                         }
-                        try? await Task.sleep(nanoseconds: isLocal ? 1_200_000_000 : 600_000_000)
+                        try? await Task.sleep(nanoseconds: isLN ? 2_000_000_000 : 600_000_000)
                         continue
                     }
                 }
             }
 
-            let errorText = lastError.map { String(describing: $0) } ?? "Unknown error"
-            let serverURL = await MainActor.run { [weak self] in
-                self?.immichServerURL ?? ""
-            }
+            // Snapshot before crossing concurrency boundaries (Swift 6).
+            let finalError = lastError
+            let errorText = finalError.map { String(describing: $0) } ?? "Unknown error"
 
             await MainActor.run { [weak self] in
                 guard let self = self else { return }
@@ -1176,29 +1229,49 @@ final class PhotoBackupViewModel: ObservableObject {
                 self.immichTestStatus = "Failed"
                 self.immichIsConnected = false
 
-                // Check if this might be a local network permission issue
-                if let error = lastError,
-                   self.isLocalNetworkURL(serverURL),
+                if let error = finalError,
+                   self.isLocalNetworkURL(serverURLSnapshot),
                    self.isLocalNetworkPermissionError(error) {
                     self.showLocalNetworkPermissionNeeded = true
-                    self.immichConnectionErrorMessage = """
-                        Could not reach your Immich server on the local network.
-
-                        macOS blocked Local Network access for this app.
-
-                        1. Click “Request Permission” below (or wait for a system dialog and press Allow).
-                        2. Or open System Settings → Privacy & Security → Local Network and turn ImmiBridge On.
-                        3. Click Try Again.
-
-                        Error: \(errorText)
-                        """
+                    self.immichConnectionErrorMessage = Self.localNetworkBlockedMessage(
+                        appIdentity: appIdentity,
+                        detail: errorText
+                    )
                 } else {
                     self.showLocalNetworkPermissionNeeded = false
-                    self.immichConnectionErrorMessage = "Could not connect to Immich after 3 attempts.\n\n\(errorText)"
+                    self.immichConnectionErrorMessage = "Could not connect to Immich after \(maxAttempts) attempts.\n\n\(errorText)"
                 }
                 self.showImmichConnectionError = true
             }
         }
+    }
+
+    private static func localNetworkAppIdentityDescription() -> String {
+        let bundle = Bundle.main
+        let bid = bundle.bundleIdentifier ?? "(unknown bundle id)"
+        let name = bundle.object(forInfoDictionaryKey: "CFBundleName") as? String ?? "ImmiBridge"
+        let path = bundle.bundlePath
+        return "\(name) · \(bid)\n\(path)"
+    }
+
+    private static func localNetworkBlockedMessage(appIdentity: String, detail: String) -> String {
+        """
+        Could not reach your Immich server on the local network.
+
+        macOS blocked Local Network access for this app.
+
+        1. Click “Request Permission” (watch for a system dialog — press Allow).
+        2. If no dialog appears: System Settings → Privacy & Security → Local Network.
+           • Find the entry that matches this app (see identity below).
+           • Turn it Off, wait 2 seconds, turn it On again.
+           • If you see multiple “ImmiBridge” entries (Xcode vs Applications), enable all of them.
+        3. Quit ImmiBridge fully (menu bar icon too) and reopen, then Try Again.
+
+        This app:
+        \(appIdentity)
+
+        Error: \(detail)
+        """
     }
 
     func maybeAutoTestImmich() {
@@ -1481,9 +1554,11 @@ final class PhotoBackupViewModel: ObservableObject {
         let timeoutValue = timeoutSeconds
 
         Task.detached(priority: .userInitiated) { [weak self] in
+            // Immutable capture — avoids "reference to captured var self" in Swift 6.
+            let model = self
             defer {
                 Task { @MainActor in
-                    self?.isExportingFailedUploads = false
+                    model?.isExportingFailedUploads = false
                 }
             }
 
@@ -1509,7 +1584,7 @@ final class PhotoBackupViewModel: ObservableObject {
             }
 
             if ids.isEmpty {
-                await MainActor.run { self?.appendLog("Export: no Photos asset ids found in failed upload records.") }
+                await MainActor.run { model?.appendLog("Export: no Photos asset ids found in failed upload records.") }
                 return
             }
 
@@ -1543,15 +1618,15 @@ final class PhotoBackupViewModel: ObservableObject {
                     options: options,
                     progress: { event in
                         if case .message(let msg) = event {
-                            Task { @MainActor in self?.appendLog("Export: \(msg)") }
+                            Task { @MainActor in model?.appendLog("Export: \(msg)") }
                         }
                     },
                     runState: { .running },
                     sessionState: nil
                 )
-                await MainActor.run { self?.appendLog("Export: done") }
+                await MainActor.run { model?.appendLog("Export: done") }
             } catch {
-                await MainActor.run { self?.appendLog("ERROR Export: \(error)") }
+                await MainActor.run { model?.appendLog("ERROR Export: \(error)") }
             }
         }
     }
@@ -1774,11 +1849,12 @@ final class PhotoBackupViewModel: ObservableObject {
     }
 
     func openLocalNetworkSettings() {
-        // Open System Settings to Privacy & Security > Local Network
-        // Prefer modern Settings deep link on Ventura+, fall back to legacy.
+        // Open System Settings → Privacy & Security → Local Network.
+        // URL schemes vary across Ventura / Sequoia / Tahoe.
         let candidates = [
+            "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_LocalNetwork",
             "x-apple.systempreferences:com.apple.preference.security?Privacy_LocalNetwork",
-            "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_LocalNetwork"
+            "x-apple.systempreferences:com.apple.preference.security"
         ]
         for s in candidates {
             if let url = URL(string: s), NSWorkspace.shared.open(url) {

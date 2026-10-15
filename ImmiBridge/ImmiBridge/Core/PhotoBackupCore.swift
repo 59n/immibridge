@@ -2179,7 +2179,6 @@ public final class PhotoBackupExporter {
             var metadataSynced = 0
             var metadataSkipped = 0
             var metadataErrors = 0
-            var metadataRecovered = 0
             var metadataNotInImmich = 0
             let metadataTotal = filtered.count
 
@@ -2215,13 +2214,10 @@ public final class PhotoBackupExporter {
                 let currentSignature = currentMetadata.signature()
 
                 // Check if we have a mapping for this asset
-                var mapping = assetMappingStore.get(localIdentifier: asset.localIdentifier)
-
                 // Immich v3 removed deviceId/deviceAssetId lookup. Recovery of pre-existing
                 // uploads without a local AssetMappingStore entry is no longer possible via API;
                 // mappings are created when ImmiBridge uploads (or from older mapping DBs).
-
-                guard let mapping = mapping else {
+                guard let mapping = assetMappingStore.get(localIdentifier: asset.localIdentifier) else {
                     // No mapping = asset not in Immich, skip
                     metadataNotInImmich += 1
                     continue
@@ -2397,7 +2393,6 @@ public final class PhotoBackupExporter {
             var summaryParts: [String] = []
             if metadataSynced > 0 { summaryParts.append("synced \(metadataSynced)") }
             if metadataSkipped > 0 { summaryParts.append("skipped \(metadataSkipped)") }
-            if metadataRecovered > 0 { summaryParts.append("recovered \(metadataRecovered) mappings") }
             if metadataErrors > 0 { summaryParts.append("errors \(metadataErrors)") }
             let summary = summaryParts.isEmpty ? "no changes" : summaryParts.joined(separator: ", ")
             progressWrapped(.message("Metadata: sync complete (\(summary))"))
@@ -3465,11 +3460,10 @@ final class ImmichClient {
             return try await session.data(for: request)
         }
         return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<(Data, URLResponse), Error>) in
-            // We have to declare `task` first so the completion handler can
-            // capture it by reference for deregister-on-completion.
-            var taskRef: URLSessionDataTask?
+            // Box avoids "mutated after capture by sendable closure" on a local var.
+            let box = URLSessionTaskBox()
             let task = session.dataTask(with: request) { data, response, error in
-                if let t = taskRef { registry.deregisterURLSessionTask(t) }
+                if let t = box.task { registry.deregisterURLSessionTask(t) }
                 if let error {
                     continuation.resume(throwing: error)
                     return
@@ -3480,7 +3474,7 @@ final class ImmichClient {
                 }
                 continuation.resume(returning: (data, response))
             }
-            taskRef = task
+            box.task = task
             registry.registerURLSessionTask(task)
             task.resume()
         }
@@ -3492,9 +3486,9 @@ final class ImmichClient {
             return try await session.upload(for: request, fromFile: fileURL)
         }
         return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<(Data, URLResponse), Error>) in
-            var taskRef: URLSessionUploadTask?
+            let box = URLSessionTaskBox()
             let task = session.uploadTask(with: request, fromFile: fileURL) { data, response, error in
-                if let t = taskRef { registry.deregisterURLSessionTask(t) }
+                if let t = box.task { registry.deregisterURLSessionTask(t) }
                 if let error {
                     continuation.resume(throwing: error)
                     return
@@ -3505,7 +3499,7 @@ final class ImmichClient {
                 }
                 continuation.resume(returning: (data, response))
             }
-            taskRef = task
+            box.task = task
             registry.registerURLSessionTask(task)
             task.resume()
         }
@@ -3515,6 +3509,11 @@ final class ImmichClient {
         let data = try await requestRaw(method: method, path: path, body: body)
         return try JSONDecoder().decode(T.self, from: data)
     }
+}
+
+/// Holds a `URLSessionTask` so completion handlers can deregister without mutating a captured local.
+private final class URLSessionTaskBox: @unchecked Sendable {
+    var task: URLSessionTask?
 }
 
 private final class ImmichUploadPipeline {

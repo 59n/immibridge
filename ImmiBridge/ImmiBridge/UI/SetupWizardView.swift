@@ -54,7 +54,7 @@ struct SetupWizardView: View {
         .alert("Immich Connection Failed", isPresented: $model.showImmichConnectionError) {
             if model.showLocalNetworkPermissionNeeded {
                 Button("Request Permission") {
-                    model.requestLocalNetworkPermission()
+                    model.requestLocalNetworkPermissionAndRetry()
                 }
                 Button("Open System Settings") {
                     model.openLocalNetworkSettings()
@@ -235,7 +235,7 @@ struct SetupWizardView: View {
                             model.testImmich()
                         } label: {
                             HStack(spacing: 6) {
-                                if model.immichTestStatus == "Testing…" {
+                                if isImmichTestInProgress {
                                     ProgressView()
                                         .scaleEffect(0.7)
                                 }
@@ -244,27 +244,42 @@ struct SetupWizardView: View {
                         }
                         .buttonStyle(SecondaryButtonStyle(height: 36))
                         .frame(width: 150)
-                        .disabled(model.immichTestStatus == "Testing…")
+                        .disabled(isImmichTestInProgress)
                     }
                 }
                 .padding(.top, 8)
+
+                if model.immichTestStatus == "Waiting for Local Network…" {
+                    Text("macOS may show a Local Network prompt — press Allow, then wait a moment.")
+                        .font(.system(.caption, design: .rounded))
+                        .foregroundStyle(DesignSystem.Colors.textSecondary)
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: 360)
+                }
             }
         }
         .padding(.horizontal, 40)
+    }
+
+    private var isImmichTestInProgress: Bool {
+        let s = model.immichTestStatus
+        return s == "Testing…"
+            || s == "Waiting for Local Network…"
+            || s.hasPrefix("Testing… (")
     }
 
     private var immichStatusKind: StatusBadge.Kind {
         if model.immichIsConnected {
             return .success
         }
-        switch model.immichTestStatus {
-        case "Testing…":
+        let s = model.immichTestStatus
+        if s == "Testing…" || s == "Waiting for Local Network…" || s.hasPrefix("Testing… (") {
             return .info
-        case "Not tested":
-            return .muted
-        default:
-            return .warning
         }
+        if s == "Not tested" {
+            return .muted
+        }
+        return .warning
     }
 
     // MARK: - Navigation

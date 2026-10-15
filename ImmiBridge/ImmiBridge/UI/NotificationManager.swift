@@ -38,22 +38,25 @@ final class NotificationManager: ObservableObject {
     // MARK: - Authorization
 
     func requestAuthorization() {
-        notificationCenter.requestAuthorization(options: [.alert, .sound, .badge]) { [weak self] granted, error in
-            Task { @MainActor [weak self] in
-                self?.checkAuthorizationStatus()
-                if let error = error {
-                    print("Notification authorization error: \(error.localizedDescription)")
-                }
+        Task { @MainActor in
+            do {
+                _ = try await notificationCenter.requestAuthorization(options: [.alert, .sound, .badge])
+            } catch {
+                print("Notification authorization error: \(error.localizedDescription)")
             }
+            await checkAuthorizationStatusAsync()
         }
     }
 
     func checkAuthorizationStatus() {
-        notificationCenter.getNotificationSettings { [weak self] settings in
-            Task { @MainActor [weak self] in
-                self?.authorizationStatus = settings.authorizationStatus
-            }
+        Task { @MainActor in
+            await checkAuthorizationStatusAsync()
         }
+    }
+
+    private func checkAuthorizationStatusAsync() async {
+        let settings = await notificationCenter.notificationSettings()
+        authorizationStatus = settings.authorizationStatus
     }
 
     func openNotificationSettings() {
@@ -126,42 +129,28 @@ final class NotificationManager: ObservableObject {
     }
 
     func sendTestNotification() {
-        // Re-check authorization status before sending
-        notificationCenter.getNotificationSettings { [weak self] settings in
-            Task { @MainActor [weak self] in
-                guard let self = self else { return }
-                self.authorizationStatus = settings.authorizationStatus
+        Task { @MainActor in
+            let settings = await notificationCenter.notificationSettings()
+            authorizationStatus = settings.authorizationStatus
 
-                if settings.authorizationStatus == .authorized {
-                    let content = UNMutableNotificationContent()
-                    content.title = "Test Notification"
-                    content.body = "Notifications are working correctly!"
-                    content.sound = .default
-
-                    let request = UNNotificationRequest(
-                        identifier: "test-notification",
-                        content: content,
-                        trigger: nil
-                    )
-
-                    self.notificationCenter.add(request) { error in
-                        if let error = error {
-                            print("Failed to send test notification: \(error.localizedDescription)")
-                        }
+            if settings.authorizationStatus == .authorized {
+                let content = UNMutableNotificationContent()
+                content.title = "Test Notification"
+                content.body = "Notifications are working correctly!"
+                content.sound = .default
+                await sendNotificationAsync(id: "test-notification", content: content)
+            } else if settings.authorizationStatus == .notDetermined {
+                do {
+                    let granted = try await notificationCenter.requestAuthorization(options: [.alert, .sound, .badge])
+                    await checkAuthorizationStatusAsync()
+                    if granted {
+                        sendTestNotification()
                     }
-                } else if settings.authorizationStatus == .notDetermined {
-                    // Request authorization first, then send
-                    self.notificationCenter.requestAuthorization(options: [.alert, .sound, .badge]) { granted, _ in
-                        Task { @MainActor [weak self] in
-                            self?.checkAuthorizationStatus()
-                            if granted {
-                                self?.sendTestNotification()
-                            }
-                        }
-                    }
-                } else {
-                    print("Notifications not authorized: \(settings.authorizationStatus.rawValue)")
+                } catch {
+                    print("Notification authorization error: \(error.localizedDescription)")
                 }
+            } else {
+                print("Notifications not authorized: \(settings.authorizationStatus.rawValue)")
             }
         }
     }
@@ -174,16 +163,21 @@ final class NotificationManager: ObservableObject {
             return
         }
 
+        Task { @MainActor in
+            await sendNotificationAsync(id: id, content: content)
+        }
+    }
+
+    private func sendNotificationAsync(id: String, content: UNMutableNotificationContent) async {
         let request = UNNotificationRequest(
             identifier: id,
             content: content,
             trigger: nil // Deliver immediately
         )
-
-        notificationCenter.add(request) { error in
-            if let error = error {
-                print("Failed to send notification: \(error.localizedDescription)")
-            }
+        do {
+            try await notificationCenter.add(request)
+        } catch {
+            print("Failed to send notification: \(error.localizedDescription)")
         }
     }
 

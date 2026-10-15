@@ -68,7 +68,7 @@ create_dmg() {
 }
 
 sync_version_metadata() {
-    local plist_path="$ROOT_DIR/ImmiBridge/ImmiBridge/UI/Info.plist"
+    local plist_path="$ROOT_DIR/ImmiBridge/Supporting/Info.plist"
     local pbxproj_path="$ROOT_DIR/ImmiBridge/ImmiBridge.xcodeproj/project.pbxproj"
 
     echo "==> Syncing app version metadata to v${VERSION}..."

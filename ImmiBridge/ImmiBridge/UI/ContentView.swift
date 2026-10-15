@@ -151,7 +151,7 @@ struct ContentView: View {
         .alert("Immich Connection Failed", isPresented: $model.showImmichConnectionError) {
             if model.showLocalNetworkPermissionNeeded {
                 Button("Request Permission") {
-                    model.requestLocalNetworkPermission()
+                    model.requestLocalNetworkPermissionAndRetry()
                 }
                 Button("Open System Settings") {
                     model.openLocalNetworkSettings()

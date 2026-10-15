@@ -143,7 +143,7 @@ public final class FileImmichSyncer {
         // Immich v3: device-id exist checks are gone. Dedup each file by SHA1 via bulk-upload-check.
         var uploaded = 0
         var skipped = 0
-        var replaced = 0
+        let replaced = 0
         var errors = 0
 
         for (idx, file) in files.enumerated() {

@@ -8,6 +8,9 @@
     <true/>
     <key>com.apple.security.network.client</key>
     <true/>
+    <!-- Helps Local Network / Bonjour browse probes used to surface the privacy prompt. -->
+    <key>com.apple.security.network.server</key>
+    <true/>
     <key>com.apple.security.files.user-selected.read-write</key>
     <true/>
     <key>com.apple.security.temporary-exception.mach-lookup.global-name</key>
